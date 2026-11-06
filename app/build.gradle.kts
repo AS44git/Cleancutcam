@@ -41,15 +41,15 @@ chaquopy {
         // Chaquopy runs pip with a Python of the same version on the build machine.
         System.getenv("CHAQUOPY_BUILD_PYTHON")?.let { buildPython(it) }
         pip {
-            // Pure-Python packages only. pycryptodome (a C extension) is replaced by the
-            // small javax.crypto-backed Crypto package in src/main/python, so the two camera
-            // libraries are installed without their dependency lists.
-            install("httpx")
-            install("requests")
-            install("xmltodict")
-            install("paho-mqtt")
-            install("--no-deps", "pyezvizapi==1.0.5.0")
-            install("--no-deps", "hikcloudstream==0.1.4")
+            // Pure-Python packages only, each listed (no dependency resolution): pycryptodome,
+            // a C extension, is replaced by the small javax.crypto-backed Crypto package in
+            // src/main/python, so nothing may pull it in.
+            options("--no-deps")
+            listOf(
+                "httpx", "httpcore", "h11", "anyio", "sniffio", "idna", "certifi", "typing_extensions",
+                "requests", "urllib3", "charset-normalizer", "xmltodict", "paho-mqtt",
+                "pyezvizapi==1.0.5.0", "hikcloudstream==0.1.4",
+            ).forEach { install(it) }
         }
     }
 }
