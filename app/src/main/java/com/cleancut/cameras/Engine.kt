@@ -1,5 +1,7 @@
 package com.cleancut.cameras
 
+import android.app.Activity
+import android.os.Bundle
 import android.app.Application
 import android.content.Context
 import android.content.SharedPreferences
@@ -15,6 +17,26 @@ class CamApp : Application() {
         super.onCreate()
         if (!Python.isStarted()) Python.start(AndroidPlatform(this))
         Store.init(this)
+        registerActivityLifecycleCallbacks(object : ActivityLifecycleCallbacks {
+            override fun onActivityStarted(a: Activity) { onScreen++ }
+            override fun onActivityStopped(a: Activity) {
+                onScreen--
+                if (onScreen <= 0) hiddenListeners.toList().forEach { it() }
+            }
+            override fun onActivityCreated(a: Activity, b: Bundle?) {}
+            override fun onActivityResumed(a: Activity) {}
+            override fun onActivityPaused(a: Activity) {}
+            override fun onActivitySaveInstanceState(a: Activity, b: Bundle) {}
+            override fun onActivityDestroyed(a: Activity) {}
+        })
+    }
+
+    companion object {
+        /** How many of the app's screens are visible (the wall stays live under full screen). */
+        var onScreen = 0
+            private set
+        /** Called when the app as a whole leaves the screen. */
+        val hiddenListeners = mutableListOf<() -> Unit>()
     }
 }
 

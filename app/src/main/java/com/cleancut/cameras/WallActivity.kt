@@ -42,6 +42,7 @@ class WallActivity : AppCompatActivity() {
             return
         }
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        CamApp.hiddenListeners += onAppHidden
         buildUi()
         if (Engine.loggedIn) showWall() else signIn()
     }
@@ -387,6 +388,7 @@ class WallActivity : AppCompatActivity() {
     override fun onStart() {
         super.onStart()
         started = true
+        handler.removeCallbacks(stopAll)
         if (Engine.loggedIn) {
             if (tiles.isEmpty()) render()
             tiles.forEach { it.setActive(true) }
@@ -395,8 +397,26 @@ class WallActivity : AppCompatActivity() {
 
     override fun onStop() {
         started = false
-        tiles.forEach { it.setActive(false) }
+        // Full screen opened on top: keep the wall live, so going back just carries on.
+        // Otherwise (home, another app, screen off) stop after a short grace period.
+        if (CamApp.onScreen <= 0) scheduleStop()
         super.onStop()
+    }
+
+    private val handler = android.os.Handler(android.os.Looper.getMainLooper())
+    private val stopAll = Runnable { if (!started) tiles.forEach { it.setActive(false) } }
+    private val onAppHidden: () -> Unit = { if (!started) scheduleStop() }
+
+    private fun scheduleStop() {
+        handler.removeCallbacks(stopAll)
+        handler.postDelayed(stopAll, 10_000)
+    }
+
+    override fun onDestroy() {
+        CamApp.hiddenListeners.remove(onAppHidden)
+        handler.removeCallbacks(stopAll)
+        tiles.forEach { it.setActive(false) }
+        super.onDestroy()
     }
 
     companion object {

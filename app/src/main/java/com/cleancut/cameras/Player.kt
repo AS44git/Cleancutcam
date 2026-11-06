@@ -223,7 +223,9 @@ class Decoder(private val surface: Surface, private val onSize: (Int, Int) -> Un
         }
         if (waitingForKey && !key) return
         val c = codec ?: return
-        val index = inputs.poll(60, TimeUnit.MILLISECONDS) ?: run {
+        // A busy decoder (several at once, or the screen being zoomed) can take a moment:
+        // wait for it; only a decoder that is really stuck costs a picture.
+        val index = inputs.poll(1500, TimeUnit.MILLISECONDS) ?: run {
             // The decoder is behind: drop this picture and pick up again at the next key frame.
             waitingForKey = true
             return

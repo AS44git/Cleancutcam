@@ -32,6 +32,8 @@ class FullActivity : AppCompatActivity() {
     private var scale = 1f
     private var panX = 0f
     private var panY = 0f
+    /** Two fingers were down in this gesture: a pinch, never a swipe. */
+    private var multiTouch = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -85,7 +87,7 @@ class FullActivity : AppCompatActivity() {
             }
 
             override fun onScroll(e1: MotionEvent?, e2: MotionEvent, dx: Float, dy: Float): Boolean {
-                if (scale <= 1.01f) return false
+                if (scale <= 1.01f || e2.pointerCount > 1) return false
                 panX -= dx
                 panY -= dy
                 clampAndApply()
@@ -93,7 +95,7 @@ class FullActivity : AppCompatActivity() {
             }
 
             override fun onFling(e1: MotionEvent?, e2: MotionEvent, vx: Float, vy: Float): Boolean {
-                if (scale > 1.01f || e1 == null) return false
+                if (scale > 1.01f || e1 == null || multiTouch) return false
                 val dx = e2.x - e1.x
                 if (abs(dx) > dp(80f) && abs(dx) > abs(e2.y - e1.y) * 1.5f) {
                     step(if (dx < 0) 1 else -1)
@@ -103,6 +105,8 @@ class FullActivity : AppCompatActivity() {
             }
         })
         view.setOnTouchListener { _, ev ->
+            if (ev.actionMasked == MotionEvent.ACTION_DOWN) multiTouch = false
+            if (ev.pointerCount > 1) multiTouch = true
             scaler.onTouchEvent(ev)
             if (!scaler.isInProgress) gestures.onTouchEvent(ev)
             true
