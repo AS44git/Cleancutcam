@@ -13,7 +13,9 @@ Called from Kotlin:
 from __future__ import annotations
 
 import json
+import struct
 import threading
+import time
 from typing import Any
 
 from hikcloudstream import Credentials, HikConnectClient
@@ -26,7 +28,6 @@ from pyezvizapi.exceptions import PyEzvizError
 from pyezvizapi.stream import (
     StreamTransport,
     VtmChannel,
-    _find_nal_start_codes,
     _video_pes_payload_ranges,
     detect_transport,
     mpeg_ps_complete_prefix_length,
@@ -155,6 +156,20 @@ def _decrypt_nal(nal: bytes, cipher) -> bytes | None:
     return None
 
 
+def _start_codes(data) -> list[tuple[int, int]]:
+    """Annex B start codes in data as (position, length), like the library's scanner, but
+    with bytes.find (C speed): the byte-by-byte one cost most of the phone's CPU."""
+    out: list[tuple[int, int]] = []
+    i = data.find(b"\x00\x00\x01")
+    while i >= 0:
+        if i > 0 and data[i - 1] == 0 and (not out or out[-1][0] + out[-1][1] <= i - 1):
+            out.append((i - 1, 4))
+        else:
+            out.append((i, 3))
+        i = data.find(b"\x00\x00\x01", i + 3)
+    return out
+
+
 class Stream:
     """One live stream: complete, decrypted NAL units in Annex B form."""
 
@@ -171,6 +186,12 @@ class Stream:
         self.es = bytearray()      # elementary stream not yet cut into whole NALs
         self.ps = bytearray()      # MPEG-PS bytes not yet parsed into whole packets
         self.closed = False
+        # How far behind live the stream is, from the RTP clock (90 kHz) against ours.
+        self.video_pt: int | None = None
+        self.last_ts: int | None = None
+        self.media_s = 0.0
+        self.best_offset: float | None = None
+        self.behind = 0.0
         with _lock:
             self.session = open_live_stream(_client, self.camera, stream_type=stream_type)
             self.session.__enter__()
@@ -200,6 +221,8 @@ class Stream:
             transport = detected if detected != StreamTransport.UNKNOWN else self.transport
             if transport == StreamTransport.RTP:
                 chunk = rtp_h264_to_annexb(body)
+                if chunk:
+                    self._clock(body)
             elif transport == StreamTransport.MPEG_PS:
                 chunk = self._from_ps(body)
             else:
@@ -224,22 +247,52 @@ class Stream:
         del self.ps[:complete]
         return b"".join(data[a:b] for a, b in _video_pes_payload_ranges(data))
 
+    def _clock(self, rtp: bytes) -> None:
+        pt = rtp[1] & 0x7F
+        if self.video_pt is None:
+            self.video_pt = pt
+        if pt != self.video_pt or len(rtp) < 12:
+            return
+        ts = struct.unpack_from(">I", rtp, 4)[0]
+        if self.last_ts is not None:
+            step = ((ts - self.last_ts + 0x80000000) & 0xFFFFFFFF) - 0x80000000
+            if -90000 * 5 < step < 90000 * 5:   # ignore jumps (camera clock reset)
+                self.media_s += step / 90000.0
+        self.last_ts = ts
+        offset = time.monotonic() - self.media_s
+        # The smallest offset seen is when the stream was most up to date.
+        if self.best_offset is None or offset < self.best_offset:
+            self.best_offset = offset
+        self.behind = offset - self.best_offset
+
+    def lag(self) -> float:
+        """Seconds the stream is behind live (0 when keeping up)."""
+        return self.behind
+
+    def reset_lag(self) -> None:
+        """Measure from now on (a camera clock running a little slow looks like lag)."""
+        self.best_offset = None
+        self.behind = 0.0
+
     def _whole_nals(self) -> bytes:
         """Cuts the buffer before its last start code: everything before it is whole NALs."""
-        starts = _find_nal_start_codes(bytes(self.es), 0, len(self.es))
-        if len(starts) < 2:
-            if len(self.es) > 4 * 1024 * 1024:
-                self.es.clear()
+        es = self.es
+        first = es.find(b"\x00\x00\x01")
+        last = es.rfind(b"\x00\x00\x01")
+        if first < 0 or last <= first:
+            if len(es) > 4 * 1024 * 1024:
+                es.clear()
             return b""
-        cut = starts[-1][0]
-        ready = bytes(self.es[:cut])
+        # A 4-byte start code (00 00 00 01) begins one byte earlier.
+        cut = last - 1 if last - 1 > first + 2 and es[last - 1] == 0 else last
+        ready = bytes(es[:cut])
         del self.es[:cut]
         return ready
 
     def _decrypt(self, data: bytes) -> bytes:
         if self.mode == "plain" or self.cipher is None:
             return data
-        starts = _find_nal_start_codes(data, 0, len(data))
+        starts = _start_codes(data)
         if not starts:
             return data
         out = bytearray(data[:starts[0][0]])

@@ -71,10 +71,28 @@ class Player(
                 decoder = Decoder(surface, listener::onVideoSize)
                 val started = SystemClock.elapsedRealtime()
                 var showing = false
+                var lastLagCheck = started
+                var lastSkip = 0L
                 while (running) {
                     val chunk = opened.callAttr("read").toJava(ByteArray::class.java)
                     if (chunk.isEmpty()) break
                     decoder.feed(chunk)
+                    // Live, never slow motion: a stream that has fallen behind (phone busy)
+                    // skips ahead to the next key frame and catches up.
+                    val now = SystemClock.elapsedRealtime()
+                    if (now - lastLagCheck >= 1_000) {
+                        lastLagCheck = now
+                        val lag = runCatching { opened.callAttr("lag").toFloat() }.getOrDefault(0f)
+                        if (lag > 2f && lastSkip > 0 && now - lastSkip in 5_000..8_000) {
+                            // Skipping didn't catch up: not lag but the camera's clock. Re-zero.
+                            runCatching { opened.callAttr("reset_lag") }
+                            lastSkip = 0L
+                        } else if (lag > 2f && now - lastSkip > 5_000) {
+                            Log.i(TAG, "camera $number: ${"%.1f".format(lag)} s behind live, skipping ahead")
+                            lastSkip = now
+                            decoder.skipToKey()
+                        }
+                    }
                     if (!showing && decoder.framesShown > 0) {
                         showing = true
                         failures = 0
@@ -339,6 +357,11 @@ class Decoder(private val surface: Surface, private val onSize: (Int, Int) -> Un
         callbackThread?.quitSafely()
         callbackThread = null
         inputs.clear()
+    }
+
+    /** Drop pictures until the next key frame (to catch up with live). */
+    fun skipToKey() {
+        waitingForKey = true
     }
 
     fun release() {
