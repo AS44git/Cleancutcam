@@ -138,7 +138,8 @@ def relogin() -> None:
 # alike): start code + a clear copy of the NAL header (1 byte H.264, 2 bytes H.265) +
 # AES-128 of the whole NAL (header included) over its first 4096 bytes in whole blocks,
 # zero IV per block (so: ECB) + the rest in the clear. Self-checking: a decrypted NAL
-# must begin with the header bytes it was sent with.
+# must begin with the header bytes it was sent with. Not every NAL is encrypted, so
+# each one is checked on its own.
 # ---------------------------------------------------------------------------
 def _decrypt_nal(nal: bytes, cipher) -> bytes | None:
     """The NAL decrypted, or None when it doesn't look encrypted with this key."""
@@ -249,10 +250,11 @@ class Stream:
             if self.mode is None and len(nal) >= 17:
                 self.checked += 1
                 self.matched += plain is not None
-                if self.checked >= 24:
-                    # Mostly matching: an encrypted stream. Hardly any: the stream is
-                    # in the clear and the rare match was chance, so stop trying.
-                    self.mode = "decrypt" if self.matched * 2 >= self.checked else "plain"
+                if self.checked >= 64:
+                    # These recorders encrypt only some NAL units (parameter sets, key
+                    # frames, about a quarter of the rest), so an encrypted stream matches
+                    # a third or more. A clear one matches only by chance (1 in 256).
+                    self.mode = "decrypt" if self.matched * 10 >= self.checked else "plain"
             out += b"\x00\x00\x00\x01"
             out += plain if (plain is not None and self.mode != "plain") else nal
         return bytes(out)
