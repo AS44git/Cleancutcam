@@ -107,6 +107,61 @@ _cameras: list = []
 _credentials: tuple[str, str] | None = None
 
 
+# ---------------------------------------------------------------------------
+# Faster opening. Every stream open asks the cloud for the account's whole relay list
+# (several pages for 88 cameras) and for five stream tokens, then uses the first token
+# only. The list is the same for every camera, so it's kept for a few minutes; tokens
+# are handed out one per stream (in case they're single-use) and refetched when used
+# up or a minute old. Any failed open forgets both, so a retry asks afresh.
+# ---------------------------------------------------------------------------
+import hikcloudstream.stream.session as _session_mod  # noqa: E402
+
+_orig_page_list = _session_mod.get_vtm_page_list
+_orig_tokens = _session_mod.get_vtdu_tokens
+_cache_lock = threading.Lock()
+_page_list: tuple[float, Any] | None = None
+_tokens: list[str] = []
+_tokens_at = 0.0
+PAGE_LIST_SECONDS = 300
+TOKEN_SECONDS = 60
+
+
+def _cached_page_list(adapter):
+    global _page_list
+    with _cache_lock:
+        if _page_list is not None and time.monotonic() - _page_list[0] < PAGE_LIST_SECONDS:
+            return _page_list[1]
+    value = _orig_page_list(adapter)
+    with _cache_lock:
+        _page_list = (time.monotonic(), value)
+    return value
+
+
+def _one_token(adapter, *args, **kwargs) -> list[str]:
+    global _tokens_at
+    with _cache_lock:
+        if _tokens and time.monotonic() - _tokens_at < TOKEN_SECONDS:
+            return [_tokens.pop(0)]
+    fresh = list(_orig_tokens(adapter, *args, **kwargs))
+    if not fresh:
+        return fresh
+    with _cache_lock:
+        _tokens[:] = fresh[1:]
+        _tokens_at = time.monotonic()
+    return fresh[:1]
+
+
+def _forget_cache() -> None:
+    global _page_list
+    with _cache_lock:
+        _page_list = None
+        _tokens.clear()
+
+
+_session_mod.get_vtm_page_list = _cached_page_list
+_session_mod.get_vtdu_tokens = _one_token
+
+
 def login(user: str, password: str) -> str:
     """Logs in and returns the account's cameras as JSON."""
     global _client, _cameras, _credentials
@@ -116,6 +171,7 @@ def login(user: str, password: str) -> str:
                 _client.close()
             except Exception:  # noqa: BLE001
                 pass
+        _forget_cache()
         client = HikConnectClient()
         client.login(Credentials(user, password))
         cameras = client.list_cameras()
@@ -192,10 +248,24 @@ class Stream:
         self.media_s = 0.0
         self.best_offset: float | None = None
         self.behind = 0.0
-        with _lock:
-            self.session = open_live_stream(_client, self.camera, stream_type=stream_type)
+        # The cloud requests one at a time (shared login); connecting to the relay and
+        # starting the stream happen outside the lock, so cameras come up side by side.
+        try:
+            with _lock:
+                self.session = open_live_stream(_client, self.camera, stream_type=stream_type)
+        except Exception:
+            _forget_cache()
+            raise
+        try:
             self.session.__enter__()
             self.session.start()
+        except Exception:
+            _forget_cache()
+            try:
+                self.session.close()
+            except Exception:  # noqa: BLE001
+                pass
+            raise
         self.packets = self.session._client.iter_packets()
 
     def close(self) -> None:

@@ -13,6 +13,7 @@ import com.chaquo.python.PyObject
 import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 import java.util.concurrent.Executors
+import java.util.concurrent.LinkedBlockingDeque
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 
@@ -135,29 +136,46 @@ class Player(
 }
 
 /**
- * H.264 / H.265 Annex B into MediaCodec: finds the codec from the parameter sets, groups
- * NAL units into access units, waits for a key frame, and renders every decoded frame
- * straight to the Surface (live: nothing is held back).
+ * H.264 / H.265 Annex B into MediaCodec. The reading thread groups NAL units into
+ * access units (one picture each) and queues them; a feeder thread hands them to the
+ * phone's decoder evenly spaced at the stream's own frame rate, so pictures that came
+ * off the network in a burst still play smoothly. At most ~300 ms is ever held: beyond
+ * that it catches up at once, and a decoder that can't keep up skips to a key frame.
  */
 class Decoder(private val surface: Surface, private val onSize: (Int, Int) -> Unit) {
     @Volatile var framesShown = 0
         private set
 
+    /** One picture, with the parameter sets in force when it arrived. */
+    private class Au(val bytes: ByteArray, val key: Boolean, val hevc: Boolean,
+                     val vps: ByteArray?, val sps: ByteArray?, val pps: ByteArray?)
+
+    // --- reading thread ---------------------------------------------------------
     private var hevc: Boolean? = null
     private var vps: ByteArray? = null
     private var sps: ByteArray? = null
     private var pps: ByteArray? = null
-    private var configuredSps: ByteArray? = null
+    private val au = ByteArrayOutputStream()
+    private var auHasPicture = false
+    private var auIsKey = false
+    private var lastArrival = 0L
 
+    // --- shared -----------------------------------------------------------------
+    private val queue = LinkedBlockingDeque<Au>()
+    @Volatile private var intervalMs = 40.0
+    @Volatile private var resync = false
+    @Volatile private var running = true
+
+    // --- feeder thread ------------------------------------------------------------
     private var codec: MediaCodec? = null
     private var callbackThread: HandlerThread? = null
     private val inputs = LinkedBlockingQueue<Int>()
     @Volatile private var broken = false
     private var waitingForKey = true
+    private var configuredSps: ByteArray? = null
 
-    private val au = ByteArrayOutputStream()
-    private var auHasPicture = false
-    private var auIsKey = false
+    // Started last, once every field above is set up.
+    private val feeder = Thread({ feedLoop() }, "feed").also { it.start() }
 
     fun feed(chunk: ByteArray) {
         var i = 0
@@ -200,23 +218,19 @@ class Decoder(private val surface: Surface, private val onSize: (Int, Int) -> Un
             isPicture = type < 32
             isKey = type in 16..23
             firstSliceOfPicture = isPicture && n.size > 2 && (n[2].toInt() and 0x80) != 0
-            when (type) {
-                32 -> vps = n
-                33 -> sps = n
-                34 -> pps = n
-            }
             startsNewAu = type == 35 || (auHasPicture && (type in 32..34 || type == 39 || firstSliceOfPicture))
         } else {
             isPicture = type in 1..5
             isKey = type == 5
             firstSliceOfPicture = isPicture && n.size > 1 && (n[1].toInt() and 0x80) != 0
-            when (type) {
-                7 -> sps = n
-                8 -> pps = n
-            }
             startsNewAu = type == 9 || (auHasPicture && (type in 6..8 || firstSliceOfPicture))
         }
         if (startsNewAu) flushAu()
+        if (isHevc) {
+            when (type) { 32 -> vps = n; 33 -> sps = n; 34 -> pps = n }
+        } else {
+            when (type) { 7 -> sps = n; 8 -> pps = n }
+        }
         au.write(START_CODE)
         au.write(n)
         if (isPicture) auHasPicture = true
@@ -231,34 +245,80 @@ class Decoder(private val surface: Surface, private val onSize: (Int, Int) -> Un
         auHasPicture = false
         auIsKey = false
         if (!hasPicture) return
+        // The stream's frame rate, from how often pictures arrive (averaged over ~1 s).
+        val now = SystemClock.uptimeMillis()
+        if (lastArrival > 0) {
+            val dt = (now - lastArrival).coerceIn(5L, 200L)
+            intervalMs = intervalMs * 0.95 + dt * 0.05
+        }
+        lastArrival = now
+        // A decoder that has fallen far behind: drop the backlog, pick up at a key frame.
+        if (queue.size > 60) {
+            queue.clear()
+            resync = true
+        }
+        queue.offer(Au(bytes, key, hevc == true, vps, sps, pps))
+    }
+
+    /** Drop pictures until the next key frame (to catch up with live). */
+    fun skipToKey() {
+        queue.clear()
+        resync = true
+    }
+
+    private fun feedLoop() {
+        var nextAt = 0L
+        try {
+            while (running) {
+                val a = queue.poll(500, TimeUnit.MILLISECONDS) ?: continue
+                if (resync) {
+                    resync = false
+                    waitingForKey = true
+                }
+                val now = SystemClock.uptimeMillis()
+                val interval = intervalMs
+                var at = maxOf(now, nextAt)
+                // More than ~300 ms waiting: catch up now rather than add delay.
+                if (at - now > 300 || queue.size * interval > 300) at = now
+                if (at > now) Thread.sleep(at - now)
+                // A touch quicker than the measured rate, so any delay drains away by itself.
+                nextAt = at + (interval * 0.95).toLong()
+                decode(a)
+            }
+        } catch (_: InterruptedException) {
+        } finally {
+            releaseCodec()
+        }
+    }
+
+    private fun decode(a: Au) {
         if (broken) {
             releaseCodec()
             broken = false
         }
-        if (codec == null || (key && sps != null && !sps.contentEquals(configuredSps))) {
-            if (!key) return
-            if (!configure()) return
+        if (codec == null || (a.key && a.sps != null && !a.sps.contentEquals(configuredSps))) {
+            if (!a.key) return
+            if (!configure(a)) return
         }
-        if (waitingForKey && !key) return
+        if (waitingForKey && !a.key) return
         val c = codec ?: return
         // A busy decoder (several at once, or the screen being zoomed) can take a moment:
         // wait for it; only a decoder that is really stuck costs a picture.
         val index = inputs.poll(1500, TimeUnit.MILLISECONDS) ?: run {
-            // The decoder is behind: drop this picture and pick up again at the next key frame.
             waitingForKey = true
             return
         }
         try {
             val buffer: ByteBuffer = c.getInputBuffer(index) ?: return
             buffer.clear()
-            if (bytes.size > buffer.capacity()) {
+            if (a.bytes.size > buffer.capacity()) {
                 c.queueInputBuffer(index, 0, 0, 0, 0)
                 waitingForKey = true
                 return
             }
-            buffer.put(bytes)
-            c.queueInputBuffer(index, 0, bytes.size, SystemClock.elapsedRealtimeNanos() / 1000,
-                if (key) MediaCodec.BUFFER_FLAG_KEY_FRAME else 0)
+            buffer.put(a.bytes)
+            c.queueInputBuffer(index, 0, a.bytes.size, SystemClock.elapsedRealtimeNanos() / 1000,
+                if (a.key) MediaCodec.BUFFER_FLAG_KEY_FRAME else 0)
             waitingForKey = false
         } catch (e: Exception) {
             Log.w(TAG, "decoder input: ${e.message}")
@@ -267,17 +327,17 @@ class Decoder(private val surface: Surface, private val onSize: (Int, Int) -> Un
         }
     }
 
-    private fun configure(): Boolean {
+    private fun configure(a: Au): Boolean {
         releaseCodec()
-        val isHevc = hevc == true
-        val s = sps ?: return false
-        val p = pps ?: return false
-        if (isHevc && vps == null) return false
+        val isHevc = a.hevc
+        val s = a.sps ?: return false
+        val p = a.pps ?: return false
+        if (isHevc && a.vps == null) return false
         val mime = if (isHevc) MediaFormat.MIMETYPE_VIDEO_HEVC else MediaFormat.MIMETYPE_VIDEO_AVC
         val format = MediaFormat.createVideoFormat(mime, 1920, 1080).apply {
             setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 4 * 1024 * 1024)
             if (isHevc) {
-                setByteBuffer("csd-0", ByteBuffer.wrap(START_CODE + vps!! + START_CODE + s + START_CODE + p))
+                setByteBuffer("csd-0", ByteBuffer.wrap(START_CODE + a.vps!! + START_CODE + s + START_CODE + p))
             } else {
                 setByteBuffer("csd-0", ByteBuffer.wrap(START_CODE + s))
                 setByteBuffer("csd-1", ByteBuffer.wrap(START_CODE + p))
@@ -285,8 +345,7 @@ class Decoder(private val surface: Surface, private val onSize: (Int, Int) -> Un
             if (Build.VERSION.SDK_INT >= 30) setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
         }
         // The hardware decoder first; software ones if it refuses (too many running, say).
-        val names = decoderNames(mime)
-        for (name in names) {
+        for (name in decoderNames(mime)) {
             val thread = HandlerThread("dec-$name").also { it.start() }
             var c: MediaCodec? = null
             try {
@@ -327,6 +386,7 @@ class Decoder(private val surface: Surface, private val onSize: (Int, Int) -> Un
                 callbackThread = thread
                 configuredSps = s
                 waitingForKey = true
+                Log.i(TAG, "decoder $name for ${if (isHevc) "H.265" else "H.264"}")
                 return true
             } catch (e: Exception) {
                 Log.w(TAG, "decoder $name unavailable: ${e.message}")
@@ -359,13 +419,12 @@ class Decoder(private val surface: Surface, private val onSize: (Int, Int) -> Un
         inputs.clear()
     }
 
-    /** Drop pictures until the next key frame (to catch up with live). */
-    fun skipToKey() {
-        waitingForKey = true
-    }
-
+    /** Stops the feeder, which releases the decoder (on its own thread, where it lives). */
     fun release() {
-        releaseCodec()
+        running = false
+        feeder.interrupt()
+        runCatching { feeder.join(2_000) }
+        queue.clear()
     }
 
     companion object {
