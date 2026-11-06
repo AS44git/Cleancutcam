@@ -20,7 +20,11 @@ import java.util.concurrent.TimeUnit
 private const val TAG = "CleancutCams"
 
 /** Which stream a view asks for. Small tiles: the light sub stream. Big tile and full screen: main. */
-enum class Quality(val streamType: Int) { TILE(2), BIG(1), FULL(1) }
+enum class Quality(val streamType: Int) {
+    TILE(2), BIG(1), FULL(1),
+    /** The quick sub stream shown on a big tile or full screen until the main one plays. */
+    PREVIEW(2),
+}
 
 /**
  * Plays one camera into a Surface: a background thread reads NAL units from the cloud
@@ -99,7 +103,7 @@ class Player(
                         failures = 0
                         status(null)
                     }
-                    if (!showing && streamType == 2 && SystemClock.elapsedRealtime() - started > 15_000) {
+                    if (!showing && streamType == 2 && quality == Quality.TILE && SystemClock.elapsedRealtime() - started > 15_000) {
                         Log.i(TAG, "camera $number: no picture on the sub stream, using the main stream")
                         streamType = 1
                         break

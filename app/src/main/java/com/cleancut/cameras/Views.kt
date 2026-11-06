@@ -19,31 +19,123 @@ import kotlin.math.min
 fun Context.dp(v: Float): Int = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, v, resources.displayMetrics).toInt()
 
 /**
- * One camera on a TextureView, fitted inside the view with its own aspect ratio, with
- * its name and a status line. Plays while active and its surface exists.
+ * The shape a picture is meant to be seen at. These recorders send 16:9 pictures squeezed
+ * into narrower frames (main 960x1080 is half of 1920x1080, sub 352x288 is CIF) without
+ * saying so in the stream, so anything narrower than 5:4 is shown as 16:9.
  */
-open class CamView(context: Context) : FrameLayout(context), TextureView.SurfaceTextureListener, Player.Listener {
-    val texture = TextureView(context)
+fun displayAspect(w: Int, h: Int): Float {
+    val a = w.toFloat() / h
+    return if (a < 1.25f) 16f / 9f else a
+}
+
+/**
+ * One camera, fitted inside the view at its real shape, with its name and a status line.
+ * Plays while active and its surface exists.
+ *
+ * The big tile and full screen play the sharp main stream, which can take several seconds
+ * to show (it sends a whole picture only every few seconds). So they also start the quick
+ * sub stream on a layer on top: a picture at once, swapped for the sharp one as soon as
+ * that plays. If the sharp stream never comes, or drops for good, the quick one stays.
+ */
+open class CamView(context: Context) : FrameLayout(context) {
     private val name = TextView(context)
     private val status = TextView(context)
-    private var surface: Surface? = null
-    private var player: Player? = null
-    private var videoW = 0
-    private var videoH = 0
+    private val main = Layer()
+    private val preview = Layer()
+    private var mainText: String? = null
 
     var cam: Cam? = null
         private set
     var quality: Quality = Quality.TILE
         private set
     private var active = false
+    private val usesPreview get() = quality != Quality.TILE
 
     /** Extra zoom/pan on top of the fit (full screen). */
     val zoom = Matrix()
 
+    /** One TextureView with its own stream. */
+    private inner class Layer : TextureView.SurfaceTextureListener {
+        val texture = TextureView(context).also { it.surfaceTextureListener = this }
+        var surface: Surface? = null
+        var player: Player? = null
+        var videoW = 0
+        var videoH = 0
+        var showing = false
+        private var gen = 0
+
+        val running get() = player != null
+
+        fun start(c: Cam, q: Quality) {
+            val s = surface ?: return
+            if (player != null) return
+            showing = false
+            val g = ++gen
+            player = Player(c.n, q, s, object : Player.Listener {
+                override fun onStatus(text: String?) {
+                    post { if (g == gen) layerStatus(this@Layer, text) }
+                }
+
+                override fun onVideoSize(width: Int, height: Int) {
+                    post {
+                        if (g == gen) {
+                            videoW = width
+                            videoH = height
+                            applyTransform()
+                        }
+                    }
+                }
+            }).start()
+        }
+
+        fun stop() {
+            gen++
+            player?.stop()
+            player = null
+            showing = false
+        }
+
+        fun fit(zoom: Matrix) {
+            val vw = texture.width.toFloat()
+            val vh = texture.height.toFloat()
+            if (vw <= 0 || vh <= 0) return
+            val m = Matrix()
+            if (videoW > 0 && videoH > 0) {
+                // The TextureView stretches the picture to the view; scale it back to its shape.
+                val videoAspect = displayAspect(videoW, videoH)
+                val viewAspect = vw / vh
+                if (videoAspect > viewAspect) m.setScale(1f, viewAspect / videoAspect, vw / 2, vh / 2)
+                else m.setScale(videoAspect / viewAspect, 1f, vw / 2, vh / 2)
+            }
+            m.postConcat(zoom)
+            texture.setTransform(m)
+        }
+
+        override fun onSurfaceTextureAvailable(st: SurfaceTexture, width: Int, height: Int) {
+            surface = Surface(st)
+            applyTransform()
+            maybeStart()
+        }
+
+        override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, width: Int, height: Int) {
+            applyTransform()
+        }
+
+        override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean {
+            stop()
+            surface?.release()
+            surface = null
+            return true
+        }
+
+        override fun onSurfaceTextureUpdated(st: SurfaceTexture) {}
+    }
+
     init {
         setBackgroundColor(context.getColor(R.color.tile))
-        addView(texture, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
-        texture.surfaceTextureListener = this
+        addView(main.texture, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
+        // On top of the main picture; it shows nothing until it has a picture of its own.
+        addView(preview.texture, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
         name.apply {
             setTextColor(Color.WHITE)
             textSize = 12.5f
@@ -66,11 +158,11 @@ open class CamView(context: Context) : FrameLayout(context), TextureView.Surface
 
     fun bind(camera: Cam?, q: Quality) {
         if (camera == cam && q == quality) return
-        stopPlayer()
+        stopPlayers()
         cam = camera
         quality = q
-        videoW = 0
-        videoH = 0
+        for (l in listOf(main, preview)) { l.videoW = 0; l.videoH = 0 }
+        mainText = null
         name.text = camera?.name ?: ""
         name.visibility = if (camera == null) View.GONE else View.VISIBLE
         status.text = if (camera == null) "＋\nAdd camera" else ""
@@ -85,82 +177,66 @@ open class CamView(context: Context) : FrameLayout(context), TextureView.Surface
 
     fun setActive(on: Boolean) {
         active = on
-        if (on) maybeStart() else stopPlayer()
+        if (on) maybeStart() else stopPlayers()
     }
 
     private fun maybeStart() {
         val c = cam ?: return
-        val s = surface ?: return
-        if (!active || player != null) return
-        status.text = "Connecting…"
-        player = Player(c.n, quality, s, this).start()
-    }
-
-    private fun stopPlayer() {
-        player?.stop()
-        player = null
-    }
-
-    // --- Player.Listener (background threads) --------------------------------
-    override fun onStatus(text: String?) {
-        post { status.text = text ?: "" }
-    }
-
-    override fun onVideoSize(width: Int, height: Int) {
-        post {
-            videoW = width
-            videoH = height
-            applyTransform()
+        if (!active) return
+        val first = !main.running && !preview.running
+        main.start(c, quality)
+        if (usesPreview && !main.showing && !preview.running) {
+            preview.texture.visibility = View.VISIBLE
+            preview.start(c, Quality.PREVIEW)
         }
+        if (first && (main.running || preview.running)) status.text = "Connecting…"
     }
 
-    // --- surface -------------------------------------------------------------
-    override fun onSurfaceTextureAvailable(st: SurfaceTexture, width: Int, height: Int) {
-        surface = Surface(st)
-        applyTransform()
-        maybeStart()
+    private fun stopPlayers() {
+        main.stop()
+        preview.stop()
+        preview.texture.visibility = View.VISIBLE
     }
 
-    override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, width: Int, height: Int) {
-        applyTransform()
+    private fun layerStatus(layer: Layer, text: String?) {
+        layer.showing = text == null
+        if (layer === main) {
+            mainText = text
+            if (text == null && preview.running) {
+                // The sharp picture is playing: the quick one is no longer needed.
+                preview.stop()
+                preview.texture.visibility = View.INVISIBLE
+            } else if (text != null && text.contains("unavailable") && usesPreview && !preview.running) {
+                // The sharp stream keeps failing: bring the quick one back meanwhile.
+                cam?.let { c ->
+                    if (active) {
+                        preview.texture.visibility = View.VISIBLE
+                        preview.start(c, Quality.PREVIEW)
+                    }
+                }
+            }
+        }
+        status.text = if (main.showing || preview.showing) "" else (mainText ?: text ?: "")
     }
-
-    override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean {
-        stopPlayer()
-        surface?.release()
-        surface = null
-        return true
-    }
-
-    override fun onSurfaceTextureUpdated(st: SurfaceTexture) {}
 
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
         super.onSizeChanged(w, h, oldw, oldh)
         post { applyTransform() }
     }
 
-    /** Fit the video inside the view (letterboxed), then the zoom on top. */
+    /** Fit the pictures inside the view (letterboxed), then the zoom on top. */
     fun applyTransform() {
-        val vw = texture.width.toFloat()
-        val vh = texture.height.toFloat()
-        if (vw <= 0 || vh <= 0) return
-        val m = Matrix()
-        if (videoW > 0 && videoH > 0) {
-            val videoAspect = videoW.toFloat() / videoH
-            val viewAspect = vw / vh
-            if (videoAspect > viewAspect) m.setScale(1f, viewAspect / videoAspect, vw / 2, vh / 2)
-            else m.setScale(videoAspect / viewAspect, 1f, vw / 2, vh / 2)
-        }
-        m.postConcat(zoom)
-        texture.setTransform(m)
+        main.fit(zoom)
+        preview.fit(zoom)
     }
 
     /** The picture's rectangle inside the view, before zoom (for limiting pans). */
     fun fittedSize(): Pair<Float, Float> {
-        val vw = texture.width.toFloat()
-        val vh = texture.height.toFloat()
-        if (videoW <= 0 || videoH <= 0) return vw to vh
-        val videoAspect = videoW.toFloat() / videoH
+        val l = if (main.videoW > 0) main else preview
+        val vw = l.texture.width.toFloat()
+        val vh = l.texture.height.toFloat()
+        if (l.videoW <= 0 || l.videoH <= 0) return vw to vh
+        val videoAspect = displayAspect(l.videoW, l.videoH)
         val viewAspect = vw / vh
         return if (videoAspect > viewAspect) vw to vw / videoAspect else vh * videoAspect to vh
     }
