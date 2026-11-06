@@ -206,8 +206,8 @@ open class CamView(context: Context) : FrameLayout(context) {
                 // The sharp picture is playing: the quick one is no longer needed.
                 preview.stop()
                 preview.texture.visibility = View.INVISIBLE
-            } else if (text != null && text.contains("unavailable") && usesPreview && !preview.running) {
-                // The sharp stream keeps failing: bring the quick one back meanwhile.
+            } else if (text != null && usesPreview && !preview.running) {
+                // The sharp stream stalled or failed: bring the quick one back meanwhile.
                 cam?.let { c ->
                     if (active) {
                         preview.texture.visibility = View.VISIBLE

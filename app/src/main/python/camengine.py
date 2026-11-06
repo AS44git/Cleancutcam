@@ -226,6 +226,75 @@ def _start_codes(data) -> list[tuple[int, int]]:
     return out
 
 
+class _Bits:
+    """Reads H.264 header fields (after removing emulation-prevention bytes)."""
+
+    def __init__(self, data: bytes) -> None:
+        self.v = int.from_bytes(data.replace(b"\x00\x00\x03", b"\x00\x00"), "big")
+        self.n = len(data.replace(b"\x00\x00\x03", b"\x00\x00")) * 8
+        self.i = 0
+
+    def u(self, k: int) -> int:
+        if self.i + k > self.n:
+            raise ValueError("short")
+        self.i += k
+        return (self.v >> (self.n - self.i)) & ((1 << k) - 1)
+
+    def ue(self) -> int:
+        z = 0
+        while self.u(1) == 0:
+            z += 1
+            if z > 31:
+                raise ValueError("bad ue")
+        return (1 << z) - 1 + (self.u(z) if z else 0)
+
+    def se(self) -> int:
+        v = self.ue()
+        return (v + 1) // 2 if v & 1 else -(v // 2)
+
+
+def _frame_num_bits(sps: bytes) -> int | None:
+    """log2_max_frame_num from an H.264 SPS NAL (header included), or None."""
+    try:
+        r = _Bits(sps[1:64])
+        profile = r.u(8)
+        r.u(16)
+        r.ue()
+        if profile in (100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135):
+            chroma = r.ue()
+            if chroma == 3:
+                r.u(1)
+            r.ue()
+            r.ue()
+            r.u(1)
+            if r.u(1):
+                for k in range(12 if chroma == 3 else 8):
+                    if r.u(1):
+                        last = nxt = 8
+                        for _ in range(16 if k < 6 else 64):
+                            if nxt:
+                                nxt = (last + r.se() + 256) % 256
+                            last = last if nxt == 0 else nxt
+        bits = r.ue() + 4
+        return bits if 4 <= bits <= 16 else None
+    except ValueError:
+        return None
+
+
+def _slice_frame_num(nal: bytes, bits: int) -> int | None:
+    """frame_num of an H.264 slice NAL (header included) if its header is plausible."""
+    try:
+        r = _Bits(nal[1:12])
+        r.ue()                      # first_mb_in_slice
+        if r.ue() > 9:              # slice_type
+            return None
+        if r.ue() > 255:            # pic_parameter_set_id
+            return None
+        return r.u(bits)
+    except ValueError:
+        return None
+
+
 class Stream:
     """One live stream: complete, decrypted NAL units in Annex B form."""
 
@@ -242,6 +311,8 @@ class Stream:
         self.es = bytearray()      # elementary stream not yet cut into whole NALs
         self.ps = bytearray()      # MPEG-PS bytes not yet parsed into whole packets
         self.closed = False
+        self.fn_bits: int | None = None     # frame_num width, from the SPS
+        self.last_fn: int | None = None     # frame_num of the last picture
         # How far behind live the stream is, from the RTP clock (90 kHz) against ours.
         self.video_pt: int | None = None
         self.last_ts: int | None = None
@@ -290,7 +361,21 @@ class Stream:
                 self.transport = detected
             transport = detected if detected != StreamTransport.UNKNOWN else self.transport
             if transport == StreamTransport.RTP:
-                chunk = rtp_h264_to_annexb(body)
+                if len(body) < 12:
+                    continue
+                pt = body[1] & 0x7F
+                if self.video_pt is None:
+                    # The video is the payload type that starts with a parameter set. Some
+                    # cameras send sound too (Front Yard 1's main stream: G.711, type 0);
+                    # depacketized as video it is garbage that stops hardware decoders.
+                    chunk = rtp_h264_to_annexb(body)
+                    if len(chunk) < 5 or chunk[4] & 0x1F != 7:
+                        continue
+                    self.video_pt = pt
+                elif pt != self.video_pt:
+                    continue
+                else:
+                    chunk = rtp_h264_to_annexb(body)
                 if chunk:
                     self._clock(body)
             elif transport == StreamTransport.MPEG_PS:
@@ -318,11 +403,6 @@ class Stream:
         return b"".join(data[a:b] for a, b in _video_pes_payload_ranges(data))
 
     def _clock(self, rtp: bytes) -> None:
-        pt = rtp[1] & 0x7F
-        if self.video_pt is None:
-            self.video_pt = pt
-        if pt != self.video_pt or len(rtp) < 12:
-            return
         ts = struct.unpack_from(">I", rtp, 4)[0]
         if self.last_ts is not None:
             step = ((ts - self.last_ts + 0x80000000) & 0xFFFFFFFF) - 0x80000000
@@ -370,6 +450,7 @@ class Stream:
             end = starts[i + 1][0] if i + 1 < len(starts) else len(data)
             nal = data[pos + length:end]
             plain = _decrypt_nal(nal, self.cipher) if len(nal) >= 17 else None
+            plain = self._check(nal, plain)
             if self.mode is None and len(nal) >= 17:
                 self.checked += 1
                 self.matched += plain is not None
@@ -378,6 +459,48 @@ class Stream:
                     # frames, about a quarter of the rest), so an encrypted stream matches
                     # a third or more. A clear one matches only by chance (1 in 256).
                     self.mode = "decrypt" if self.matched * 10 >= self.checked else "plain"
+            chosen = plain if (plain is not None and self.mode != "plain") else nal
+            self._track(chosen)
             out += b"\x00\x00\x00\x01"
-            out += plain if (plain is not None and self.mode != "plain") else nal
+            out += chosen
         return bytes(out)
+
+    # The header check alone (decrypted NAL starts with its clear header byte) passes
+    # one clear NAL in 256 by chance, and decrypting a clear picture scrambles it, which
+    # stops hardware decoders. So for H.264 pictures the decrypted result must also carry
+    # the next frame number (frame_num counts up by one per picture, 10 bits here).
+    def _expected(self, idr: bool) -> set[int] | None:
+        if idr:
+            return {0}
+        if self.last_fn is None or self.fn_bits is None:
+            return None
+        m = 1 << self.fn_bits
+        return {self.last_fn, (self.last_fn + 1) % m}
+
+    def _check(self, nal: bytes, plain: bytes | None) -> bytes | None:
+        if plain is None or not nal or self.fn_bits is None:
+            return plain
+        t = nal[0] & 0x1F
+        if t not in (1, 5):
+            return plain
+        dec_fn = _slice_frame_num(plain, self.fn_bits)
+        if dec_fn is None:
+            return None                         # not a picture header: a chance match
+        want = self._expected(t == 5)
+        if want is None or dec_fn in want:
+            return plain
+        # Wrong number. If the NAL as sent carries the right one, it was in the clear.
+        if _slice_frame_num(nal, self.fn_bits) in want:
+            return None
+        return plain                            # neither fits (packets lost): trust the key
+
+    def _track(self, nal: bytes) -> None:
+        if not nal:
+            return
+        t = nal[0] & 0x1F
+        if t == 7:
+            self.fn_bits = _frame_num_bits(nal) or self.fn_bits
+        elif t in (1, 5) and self.fn_bits is not None:
+            fn = _slice_frame_num(nal, self.fn_bits)
+            if fn is not None:
+                self.last_fn = fn
