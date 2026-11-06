@@ -265,7 +265,7 @@ class WallActivity : AppCompatActivity() {
 
         private fun group(cams: List<Cam>): List<Any> {
             val out = mutableListOf<Any>()
-            cams.groupBy { it.recorder }.forEach { (rec, list) -> out += rec; out += list }
+            cams.groupBy { it.recorder }.forEach { (rec, list) -> out.add(rec); out.addAll(list) }
             return out
         }
 
