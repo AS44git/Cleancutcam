@@ -115,7 +115,7 @@ class WallActivity : AppCompatActivity() {
 
     private fun showWall() {
         loading.visibility = View.GONE
-        if (Store.order.isEmpty()) {
+        if (!Store.hasOrder) {
             val cams = Engine.cameras
             // This account's home cameras (37-44); otherwise the first eight.
             Store.order = if (cams.size >= 44) (37..44).toList() else cams.take(8).map { it.n }
@@ -134,7 +134,7 @@ class WallActivity : AppCompatActivity() {
             b.setTextColor(if (on) Color.WHITE else getColor(R.color.muted))
             (b.background as GradientDrawable).setColor(if (on) getColor(R.color.accent) else Color.TRANSPARENT)
         }
-        val order = Store.order.filter { Engine.camera(it) != null }
+        val order = Store.order
         while (tiles.size < spec.slots) {
             val t = CamView(this)
             tiles += t
@@ -146,11 +146,12 @@ class WallActivity : AppCompatActivity() {
             wall.removeView(t)
         }
         tiles.forEachIndexed { i, t ->
-            val cam = order.getOrNull(i)?.let { Engine.camera(it) }
+            val cam = order.getOrNull(i)?.takeIf { it > 0 }?.let { Engine.camera(it) }
             val q = if (i == 0 && spec.big > 1) Quality.BIG else Quality.TILE
             t.bind(cam, q)
-            t.setOnClickListener { cam?.let { openFull(it.n) } }
-            t.setOnLongClickListener { v -> cam?.let { tileMenu(v, i) }; true }
+            // An empty spot: tap (or long-press) it to choose its camera.
+            t.setOnClickListener { if (cam != null) openFull(cam.n) else pickFor(i) }
+            t.setOnLongClickListener { v -> if (cam != null) tileMenu(v, i) else pickFor(i); true }
             if (started) t.setActive(true)
         }
     }
@@ -163,18 +164,24 @@ class WallActivity : AppCompatActivity() {
     private fun openFull(n: Int) {
         startActivity(Intent(this, FullActivity::class.java)
             .putExtra("n", n)
-            .putExtra("order", Store.order.toIntArray()))
+            .putExtra("order", Store.order.filter { it > 0 }.toIntArray()))
     }
 
     private fun tileMenu(anchor: View, slot: Int) {
         PopupMenu(this, anchor).apply {
-            if (slot != 0) menu.add(0, 1, 0, "Make big")
-            menu.add(0, 2, 1, "Remove from the wall")
+            if (slot != 0 && spec().big > 1) menu.add(0, 1, 0, "Make big")
+            menu.add(0, 3, 1, "Change camera…")
+            menu.add(0, 2, 2, "Remove from the wall")
             setOnMenuItemClickListener { item ->
-                val order = Store.order.toMutableList()
+                if (item.itemId == 3) {
+                    pickFor(slot)
+                    return@setOnMenuItemClickListener true
+                }
+                val order = padded(slot)
                 when (item.itemId) {
-                    1 -> if (slot < order.size) { val x = order[slot]; order[slot] = order[0]; order[0] = x }
-                    2 -> if (slot < order.size) order.removeAt(slot)
+                    1 -> { val x = order[slot]; order[slot] = order[0]; order[0] = x }
+                    // The spot stays where it is, empty, ready for another camera.
+                    2 -> order[slot] = 0
                 }
                 Store.order = order
                 render()
@@ -221,7 +228,59 @@ class WallActivity : AppCompatActivity() {
             .show()
     }
 
+    /** The saved order, long enough to hold [slot]. */
+    private fun padded(slot: Int): MutableList<Int> {
+        val order = Store.order.toMutableList()
+        while (order.size <= slot) order.add(0)
+        return order
+    }
+
+    /** Puts [n] in [slot]; a camera already elsewhere on the wall swaps places with it. */
+    private fun place(n: Int, slot: Int) {
+        val order = padded(slot)
+        val was = order.indexOf(n)
+        if (was >= 0) order[was] = order[slot]
+        order[slot] = n
+        Store.order = order
+        render()
+    }
+
     // --- choose cameras ---------------------------------------------------------
+    /** One camera for one spot on the wall. */
+    private fun pickFor(slot: Int) {
+        val cams = Engine.cameras
+        if (cams.isEmpty()) return
+        val search = EditText(this).apply { hint = "Search cameras or recorders"; setSingleLine() }
+        val list = ListView(this)
+        val adapter = PickerAdapter(cams)
+        list.adapter = adapter
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            val p = dp(16f); setPadding(p, dp(4f), p, 0)
+            addView(TextView(this@WallActivity).apply {
+                text = "Numbered cameras are already on the wall; picking one swaps the two."
+                setTextColor(getColor(R.color.muted)); textSize = 12.5f
+            })
+            addView(search)
+            addView(list, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(420f)))
+        }
+        val dialog = AlertDialog.Builder(this)
+            .setTitle("Camera for spot ${slot + 1}")
+            .setView(box)
+            .setNegativeButton("Cancel", null)
+            .show()
+        list.setOnItemClickListener { _, _, position, _ ->
+            val cam = adapter.rows[position] as? Cam ?: return@setOnItemClickListener
+            place(cam.n, slot)
+            dialog.dismiss()
+        }
+        search.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+            override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+            override fun afterTextChanged(s: Editable?) { adapter.filter(s?.toString() ?: "") }
+        })
+    }
+
     private fun pickCameras() {
         val cams = Engine.cameras
         if (cams.isEmpty()) return
@@ -232,7 +291,13 @@ class WallActivity : AppCompatActivity() {
         list.setOnItemClickListener { _, _, position, _ ->
             val cam = adapter.rows[position] as? Cam ?: return@setOnItemClickListener
             val order = Store.order.toMutableList()
-            if (!order.remove(cam.n)) order.add(cam.n)
+            val at = order.indexOf(cam.n)
+            if (at >= 0) {
+                order[at] = 0                       // off the wall; the others stay put
+            } else {
+                val gap = order.indexOf(0)          // the first empty spot, else the end
+                if (gap >= 0) order[gap] = cam.n else order.add(cam.n)
+            }
             Store.order = order
             adapter.notifyDataSetChanged()
             render()
@@ -246,7 +311,7 @@ class WallActivity : AppCompatActivity() {
             orientation = LinearLayout.VERTICAL
             val p = dp(16f); setPadding(p, dp(4f), p, 0)
             addView(TextView(this@WallActivity).apply {
-                text = "Tap cameras in the order you want them; the first is the big tile. Tap again to remove."
+                text = "Tap a camera to add it to the next empty spot (1 is the big tile); tap it again to take it off."
                 setTextColor(getColor(R.color.muted)); textSize = 12.5f
             })
             addView(search)

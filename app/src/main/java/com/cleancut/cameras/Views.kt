@@ -73,7 +73,7 @@ open class CamView(context: Context) : FrameLayout(context), TextureView.Surface
         videoH = 0
         name.text = camera?.name ?: ""
         name.visibility = if (camera == null) View.GONE else View.VISIBLE
-        status.text = if (camera == null) "Empty · tap Cameras to add" else ""
+        status.text = if (camera == null) "Empty · tap to add a camera" else ""
         maybeStart()
     }
 

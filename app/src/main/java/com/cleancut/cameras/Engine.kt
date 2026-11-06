@@ -112,8 +112,11 @@ object Store {
         get() = plain.getString("layout", "7+1") ?: "7+1"
         set(v) = plain.edit().putString("layout", v).apply()
 
-    /** The wall's cameras, by number, in order (the first is the big tile). */
+    /** The wall's cameras, by number, spot by spot (the first is the big tile); 0 is an empty spot. */
     var order: List<Int>
         get() = plain.getString("order", null)?.split(',')?.mapNotNull { it.trim().toIntOrNull() } ?: emptyList()
-        set(v) = plain.edit().putString("order", v.joinToString(",")).apply()
+        set(v) = plain.edit().putString("order", v.dropLastWhile { it <= 0 }.joinToString(",")).apply()
+
+    /** Whether a wall was ever saved (an empty one stays empty). */
+    val hasOrder: Boolean get() = plain.contains("order")
 }
